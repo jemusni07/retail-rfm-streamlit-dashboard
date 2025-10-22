@@ -699,7 +699,7 @@ def render_rfm_tab(df_rfm):
     """Render RFM Segmentation tab content"""
     st.markdown("""
     <div class="main-header">
-        <h1>RFM Customer Segmentation Dashboard</h1>
+        <h1>RFM Customer Segmentation</h1>
         <p>Group customers into distinct segments based on their Recency, Frequency, and Monetary Value to enable targeted marketing campaigns, optimize resource allocation and improve customer retention.</p>
     </div>
     """, unsafe_allow_html=True)
