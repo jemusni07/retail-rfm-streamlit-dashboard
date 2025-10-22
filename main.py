@@ -7,13 +7,14 @@ import os
 from dotenv import load_dotenv
 from databricks import sql
 import numpy as np
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
 
 # Page configuration
 st.set_page_config(
-    page_title="RFM Customer Segmentation Dashboard",
+    page_title="Retail Analytics Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -173,14 +174,32 @@ st.markdown("""
     .stSpinner > div {
         border-top-color: #3b82f6;
     }
+    
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        background-color: white;
+        border-radius: 8px;
+        border: 2px solid #000000;
+        color: #000000;
+        font-weight: 500;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background-color: #000000;
+        color: white;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
-def load_data():
-    """Load data from Databricks"""
+def load_rfm_data():
+    """Load RFM segmentation data from Databricks"""
     try:
-        # Use warehouse ID if available, otherwise use HTTP path
         warehouse_id = os.getenv('DATABRICKS_WAREHOUSE_ID')
         if warehouse_id:
             http_path = f"/sql/1.0/warehouses/{warehouse_id}"
@@ -209,12 +228,345 @@ def load_data():
         
         return df
     except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
+        st.error(f"Error loading RFM data: {str(e)}")
         return None
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def load_transaction_data():
+    """Load transaction data for time-series analysis"""
+    try:
+        warehouse_id = os.getenv('DATABRICKS_WAREHOUSE_ID')
+        if warehouse_id:
+            http_path = f"/sql/1.0/warehouses/{warehouse_id}"
+        else:
+            http_path = os.getenv('DATABRICKS_HTTP_PATH')
+        
+        connection = sql.connect(
+            server_hostname=os.getenv('DATABRICKS_SERVER_HOSTNAME'),
+            http_path=http_path,
+            access_token=os.getenv('DATABRICKS_ACCESS_TOKEN')
+        )
+        
+        cursor = connection.cursor()
+        
+        # Query for time-series analysis - FIXED: Added InvoiceNo to SELECT
+        query = """
+        SELECT 
+            InvoiceNo,
+            InvoiceDate,
+            Year,
+            Month,
+            CustomerID,
+            TotalPrice,
+            Quantity,
+            Country,
+            IsCancellation,
+            ingestion_timestamp,
+            processing_date
+        FROM retail_analytics.dlt.retail_transactions_silver
+        WHERE IsCancellation = false 
+        AND CustomerID IS NOT NULL
+        ORDER BY InvoiceDate
+        """
+        
+        cursor.execute(query)
+        columns = [desc[0] for desc in cursor.description]
+        data = cursor.fetchall()
+        
+        df = pd.DataFrame(data, columns=columns)
+        
+        # Convert date columns
+        if not df.empty:
+            df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'])
+            df['processing_date'] = pd.to_datetime(df['processing_date'])
+            df['ingestion_timestamp'] = pd.to_datetime(df['ingestion_timestamp'])
+        
+        cursor.close()
+        connection.close()
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading transaction data: {str(e)}")
+        return None
+
+@st.cache_data(ttl=300)
+def get_data_freshness_metrics(df):
+    """Calculate data freshness metrics"""
+    try:
+        # Convert all datetime columns to timezone-naive
+        latest_ingestion = pd.to_datetime(df['ingestion_timestamp'].max()).tz_localize(None)
+        latest_transaction = pd.to_datetime(df['InvoiceDate'].max()).tz_localize(None)
+        oldest_transaction = pd.to_datetime(df['InvoiceDate'].min()).tz_localize(None)
+        
+        # Data coverage
+        date_range = (latest_transaction - oldest_transaction).days
+        
+        # Processing lag
+        df_temp = df.copy()
+        df_temp['InvoiceDate'] = pd.to_datetime(df_temp['InvoiceDate']).dt.tz_localize(None)
+        df_temp['ingestion_timestamp'] = pd.to_datetime(df_temp['ingestion_timestamp']).dt.tz_localize(None)
+        
+        processing_lag = df_temp.groupby('InvoiceDate').agg({
+            'ingestion_timestamp': 'first',
+            'processing_date': 'first'
+        }).reset_index()
+        processing_lag['lag_days'] = (processing_lag['ingestion_timestamp'] - processing_lag['InvoiceDate']).dt.days
+        avg_lag = processing_lag['lag_days'].mean()
+        
+        return {
+            'latest_ingestion': latest_ingestion,
+            'latest_transaction': latest_transaction,
+            'oldest_transaction': oldest_transaction,
+            'date_range_days': date_range,
+            'avg_processing_lag': avg_lag,
+            'total_records': len(df)
+        }
+    except Exception as e:
+        st.error(f"Error calculating freshness metrics: {str(e)}")
+        return None
+
+def create_customer_growth_chart(df):
+    """Create cumulative customer growth over time"""
+    # Get unique customers by first purchase date
+    customer_first_purchase = df.groupby('CustomerID')['InvoiceDate'].min().reset_index()
+    customer_first_purchase.columns = ['CustomerID', 'FirstPurchaseDate']
+    
+    # Create daily customer counts
+    daily_new_customers = customer_first_purchase.groupby('FirstPurchaseDate').size().reset_index()
+    daily_new_customers.columns = ['Date', 'NewCustomers']
+    daily_new_customers = daily_new_customers.sort_values('Date')
+    daily_new_customers['CumulativeCustomers'] = daily_new_customers['NewCustomers'].cumsum()
+    
+    # Create figure with dual y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Add cumulative customers line
+    fig.add_trace(
+        go.Scatter(
+            x=daily_new_customers['Date'],
+            y=daily_new_customers['CumulativeCustomers'],
+            name='Total Customers',
+            line=dict(color='#3b82f6', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(59, 130, 246, 0.1)'
+        ),
+        secondary_y=False
+    )
+    
+    # Add new customers bar chart
+    fig.add_trace(
+        go.Bar(
+            x=daily_new_customers['Date'],
+            y=daily_new_customers['NewCustomers'],
+            name='New Customers',
+            marker_color='#10b981',
+            opacity=0.6
+        ),
+        secondary_y=True
+    )
+    
+    fig.update_layout(
+        title='Customer Growth Over Time',
+        xaxis_title='Date',
+        height=450,
+        hovermode='x unified',
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family="Arial", size=12),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    fig.update_yaxes(title_text="Total Customers", secondary_y=False, gridcolor='rgba(128,128,128,0.2)')
+    fig.update_yaxes(title_text="New Customers per Day", secondary_y=True)
+    
+    return fig
+
+def create_revenue_trend_chart(df):
+    """Create revenue trend over time"""
+    # Monthly revenue aggregation
+    monthly_revenue = df.groupby(df['InvoiceDate'].dt.to_period('M')).agg({
+        'TotalPrice': 'sum',
+        'CustomerID': 'nunique',
+        'InvoiceNo': 'nunique'
+    }).reset_index()
+    
+    monthly_revenue['InvoiceDate'] = monthly_revenue['InvoiceDate'].dt.to_timestamp()
+    monthly_revenue.columns = ['Month', 'Revenue', 'UniqueCustomers', 'Orders']
+    
+    # Calculate growth rates
+    monthly_revenue['RevenueGrowth'] = monthly_revenue['Revenue'].pct_change() * 100
+    monthly_revenue['CustomerGrowth'] = monthly_revenue['UniqueCustomers'].pct_change() * 100
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Monthly Revenue', 'Month-over-Month Growth Rate'),
+        vertical_spacing=0.15,
+        row_heights=[0.6, 0.4]
+    )
+    
+    # Revenue bars
+    fig.add_trace(
+        go.Bar(
+            x=monthly_revenue['Month'],
+            y=monthly_revenue['Revenue'],
+            name='Revenue',
+            marker_color='#667eea',
+            text=monthly_revenue['Revenue'].apply(lambda x: f'${x:,.0f}'),
+            textposition='outside'
+        ),
+        row=1, col=1
+    )
+    
+    # Growth rate line
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_revenue['Month'],
+            y=monthly_revenue['RevenueGrowth'],
+            name='Revenue Growth %',
+            line=dict(color='#f59e0b', width=3),
+            mode='lines+markers'
+        ),
+        row=2, col=1
+    )
+    
+    fig.update_layout(
+        height=600,
+        showlegend=True,
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family="Arial", size=12)
+    )
+    
+    fig.update_xaxes(title_text="Month", row=2, col=1)
+    fig.update_yaxes(title_text="Revenue ($)", gridcolor='rgba(128,128,128,0.2)', row=1, col=1)
+    fig.update_yaxes(title_text="Growth Rate (%)", gridcolor='rgba(128,128,128,0.2)', row=2, col=1)
+    
+    return fig
+
+def create_customer_cohort_chart(df):
+    """Create customer cohort retention analysis"""
+    # Prepare cohort data - work with a copy to avoid modifying original
+    df_cohort = df.copy()
+    df_cohort['CohortMonth'] = df_cohort.groupby('CustomerID')['InvoiceDate'].transform('min').dt.to_period('M')
+    df_cohort['InvoiceMonth'] = df_cohort['InvoiceDate'].dt.to_period('M')
+    
+    # Calculate cohort periods
+    df_cohort['CohortPeriod'] = (df_cohort['InvoiceMonth'] - df_cohort['CohortMonth']).apply(lambda x: x.n)
+    
+    # Create cohort matrix
+    cohort_data = df_cohort.groupby(['CohortMonth', 'CohortPeriod'])['CustomerID'].nunique().reset_index()
+    cohort_pivot = cohort_data.pivot(index='CohortMonth', columns='CohortPeriod', values='CustomerID')
+    
+    # Calculate retention rates
+    cohort_size = cohort_pivot.iloc[:, 0]
+    retention = cohort_pivot.divide(cohort_size, axis=0) * 100
+    
+    # Convert Period index to string to avoid JSON serialization issues
+    retention_display = retention.iloc[:12, :12].copy()
+    retention_display.index = retention_display.index.astype(str)
+    
+    # Create heatmap
+    fig = px.imshow(
+        retention_display,
+        labels=dict(x="Months Since First Purchase", y="Cohort Month", color="Retention %"),
+        title='Customer Retention Cohort Analysis (First 12 Months)',
+        color_continuous_scale='RdYlGn',
+        aspect='auto'
+    )
+    
+    fig.update_layout(height=500)
+    
+    return fig
+
+def create_active_customers_chart(df):
+    """Create monthly active customers trend"""
+    monthly_active = df.groupby(df['InvoiceDate'].dt.to_period('M')).agg({
+        'CustomerID': 'nunique',
+        'TotalPrice': 'sum',
+        'InvoiceNo': 'nunique'
+    }).reset_index()
+    
+    monthly_active['InvoiceDate'] = monthly_active['InvoiceDate'].dt.to_timestamp()
+    monthly_active.columns = ['Month', 'ActiveCustomers', 'Revenue', 'Orders']
+    monthly_active['AvgRevenuePerCustomer'] = monthly_active['Revenue'] / monthly_active['ActiveCustomers']
+    
+    # Create dual-axis chart
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    fig.add_trace(
+        go.Bar(
+            x=monthly_active['Month'],
+            y=monthly_active['ActiveCustomers'],
+            name='Active Customers',
+            marker_color='#4facfe'
+        ),
+        secondary_y=False
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_active['Month'],
+            y=monthly_active['AvgRevenuePerCustomer'],
+            name='Avg Revenue per Customer',
+            line=dict(color='#f5576c', width=3),
+            mode='lines+markers'
+        ),
+        secondary_y=True
+    )
+    
+    fig.update_layout(
+        title='Monthly Active Customers & Average Revenue',
+        xaxis_title='Month',
+        height=450,
+        hovermode='x unified',
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    fig.update_yaxes(title_text="Active Customers", secondary_y=False, gridcolor='rgba(128,128,128,0.2)')
+    fig.update_yaxes(title_text="Avg Revenue per Customer ($)", secondary_y=True)
+    
+    return fig
+
+def create_country_revenue_chart(df):
+    """Create top countries by revenue"""
+    country_revenue = df.groupby('Country').agg({
+        'TotalPrice': 'sum',
+        'CustomerID': 'nunique',
+        'InvoiceNo': 'nunique'
+    }).reset_index()
+    
+    country_revenue.columns = ['Country', 'Revenue', 'Customers', 'Orders']
+    country_revenue = country_revenue.sort_values('Revenue', ascending=False).head(10)
+    
+    fig = px.bar(
+        country_revenue,
+        x='Revenue',
+        y='Country',
+        orientation='h',
+        title='Top 10 Countries by Revenue',
+        color='Revenue',
+        color_continuous_scale='Blues',
+        text='Revenue'
+    )
+    
+    fig.update_traces(texttemplate='$%{text:,.0f}', textposition='outside')
+    fig.update_layout(
+        height=450,
+        showlegend=False,
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(gridcolor='rgba(128,128,128,0.2)'),
+        yaxis=dict(gridcolor='rgba(128,128,128,0.2)')
+    )
+    
+    return fig
+
+# RFM Visualization Functions (from original code)
 def create_segment_count_chart(df):
     """Create customer count visualization by segment"""
-    # Custom color palette - vibrant gradient
     colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe', '#43e97b', '#38f9d7']
     
     fig = px.bar(
@@ -240,13 +592,12 @@ def create_segment_count_chart(df):
     return fig
 
 def create_segment_revenue_chart(df):
-    """Create total revenue visualization by segment"""
-    # Custom color palette - cool tones
+    """Create revenue visualization by segment"""
     colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe', '#43e97b', '#38f9d7']
     
     fig = px.bar(
-        df, 
-        x='Segment', 
+        df,
+        x='Segment',
         y='Total_Revenue',
         title='Total Revenue by Segment',
         color='Segment',
@@ -268,7 +619,6 @@ def create_segment_revenue_chart(df):
 
 def create_revenue_distribution_pie(df):
     """Create pie chart showing revenue distribution across segments"""
-    # Custom color palette - matching bar charts
     custom_colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe', '#43e97b', '#38f9d7']
     
     fig = px.pie(
@@ -289,7 +639,6 @@ def create_revenue_distribution_pie(df):
 
 def create_customer_distribution_pie(df):
     """Create pie chart showing customer distribution across segments"""
-    # Custom color palette - matching bar charts
     custom_colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe', '#43e97b', '#38f9d7']
     
     fig = px.pie(
@@ -310,7 +659,6 @@ def create_customer_distribution_pie(df):
 
 def create_rfm_heatmap(df):
     """Create RFM metrics heatmap"""
-    # Create a pivot table for RFM metrics
     metrics_df = df[['Segment', 'Avg_Recency', 'Avg_Frequency', 'Avg_Monetary']].copy()
     metrics_df = metrics_df.set_index('Segment')
     
@@ -325,14 +673,12 @@ def create_rfm_heatmap(df):
 
 def create_segment_performance_table(df):
     """Create styled segment performance table"""
-    # Select key columns for the table
     table_df = df[[
         'Segment', 'recommendation', 'Customer_Count', 
         'Total_Revenue', 'Pct_of_Customers', 'Pct_of_Revenue',
         'Avg_Monetary', 'Avg_Frequency', 'Avg_Recency'
     ]].copy()
     
-    # Format columns for better display
     table_df['Customer_Count'] = table_df['Customer_Count'].apply(lambda x: f"{x:,}")
     table_df['Total_Revenue'] = table_df['Total_Revenue'].apply(lambda x: f"${x:,.2f}")
     table_df['Pct_of_Customers'] = table_df['Pct_of_Customers'].apply(lambda x: f"{x:.1f}%")
@@ -341,7 +687,6 @@ def create_segment_performance_table(df):
     table_df['Avg_Frequency'] = table_df['Avg_Frequency'].apply(lambda x: f"{x:.1f}")
     table_df['Avg_Recency'] = table_df['Avg_Recency'].apply(lambda x: f"{x:.1f}")
     
-    # Rename columns for better display
     table_df.columns = [
         'Segment', 'Recommendation', 'Customer Count', 
         'Total Revenue', '% of Customers', '% of Revenue',
@@ -350,8 +695,8 @@ def create_segment_performance_table(df):
     
     return table_df
 
-def main():
-    # Custom header
+def render_rfm_tab(df_rfm):
+    """Render RFM Segmentation tab content"""
     st.markdown("""
     <div class="main-header">
         <h1>RFM Customer Segmentation Dashboard</h1>
@@ -359,48 +704,116 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
-    # Load data
-    df = load_data()
-    
-    if df is None:
-        st.error("Unable to load data. Please check your Databricks configuration.")
-        return
-    
     # Sidebar filters
-    st.sidebar.header("Filters")
+    st.sidebar.header("RFM Filters")
     
-    # Get all unique segments
-    all_segments = sorted(df['Segment'].unique().tolist())
+    all_segments = sorted(df_rfm['Segment'].unique().tolist())
     
-    # Radio button to choose between All or Custom
     filter_type = st.sidebar.radio(
         "Filter Type:",
         options=["All Segments", "Custom Selection"],
-        index=0
+        index=0,
+        key='rfm_filter'
     )
     
-    # Show multiselect only if Custom Selection is chosen
     if filter_type == "All Segments":
-        df_filtered = df.copy()
+        df_filtered = df_rfm.copy()
         st.sidebar.info(f"Showing all {len(all_segments)} segments")
     else:
-        # Custom selection - allow picking one or more segments
         selected_segments = st.sidebar.multiselect(
             "Choose one or more segments:",
             options=all_segments,
-            default=all_segments[:1] if all_segments else []
+            default=all_segments[:1] if all_segments else [],
+            key='rfm_segments'
         )
         
-        # Filter data based on selection
         if len(selected_segments) > 0:
-            df_filtered = df[df['Segment'].isin(selected_segments)].copy()
+            df_filtered = df_rfm[df_rfm['Segment'].isin(selected_segments)].copy()
             st.sidebar.success(f"Showing {len(selected_segments)} segment(s)")
         else:
-            df_filtered = df.copy()
+            df_filtered = df_rfm.copy()
             st.sidebar.warning("No segments selected - showing all data")
     
-    # Key metrics with custom styling
-    st.markdown('<div class="section-header">Key Performance Metrics</div>', unsafe_allow_html=True)
+    # Visualizations
+    st.markdown('<div class="section-header">Customer Segment Analysis</div>', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        fig_count = create_segment_count_chart(df_filtered)
+        st.plotly_chart(fig_count, use_container_width=True, config={'displayModeBar': False})
+    
+    with col2:
+        fig_revenue = create_segment_revenue_chart(df_filtered)
+        st.plotly_chart(fig_revenue, use_container_width=True, config={'displayModeBar': False})
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        fig_customer_pie = create_customer_distribution_pie(df_filtered)
+        st.plotly_chart(fig_customer_pie, use_container_width=True, config={'displayModeBar': False})
+    
+    with col2:
+        fig_revenue_pie = create_revenue_distribution_pie(df_filtered)
+        st.plotly_chart(fig_revenue_pie, use_container_width=True, config={'displayModeBar': False})
+    
+    st.markdown('<div class="section-header">RFM Metrics Analysis</div>', unsafe_allow_html=True)
+    fig_heatmap = create_rfm_heatmap(df_filtered)
+    st.plotly_chart(fig_heatmap, use_container_width=True, config={'displayModeBar': False})
+    
+    st.markdown('<div class="section-header">Segment Performance & Recommendations</div>', unsafe_allow_html=True)
+    table_df = create_segment_performance_table(df_filtered)
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+def render_insights_tab(df_trans):
+    """Render Customer & Revenue Insights tab content"""
+    st.markdown("""
+    <div class="main-header">
+        <h1>Customer Growth & Revenue Insights</h1>
+        <p>Track customer acquisition, revenue trends, and data freshness to understand business performance over time.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Data freshness metrics
+    freshness = get_data_freshness_metrics(df_trans)
+    
+    if freshness:
+        st.markdown('<div class="section-header">Data Freshness & Quality</div>', unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Latest Transaction</h3>
+                <div class="metric-value">{freshness['latest_transaction'].strftime('%Y-%m-%d')}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Last Ingestion</h3>
+                <div class="metric-value">{freshness['latest_ingestion'].strftime('%Y-%m-%d')}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Data Coverage</h3>
+                <div class="metric-value">{freshness['date_range_days']} days</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+    
+    # Customer and revenue metrics
+    st.markdown('<div class="section-header">Business Performance Metrics</div>', unsafe_allow_html=True)
+    
+    total_customers = df_trans['CustomerID'].nunique()
+    total_revenue = df_trans['TotalPrice'].sum()
+    total_orders = df_trans['InvoiceNo'].nunique()
+    avg_order_value = total_revenue / total_orders
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -408,7 +821,7 @@ def main():
         st.markdown(f"""
         <div class="metric-card">
             <h3>Total Customers</h3>
-            <div class="metric-value">{df_filtered['Customer_Count'].sum():,}</div>
+            <div class="metric-value">{total_customers:,}</div>
         </div>
         """, unsafe_allow_html=True)
     
@@ -416,114 +829,71 @@ def main():
         st.markdown(f"""
         <div class="metric-card">
             <h3>Total Revenue</h3>
-            <div class="metric-value">${df_filtered['Total_Revenue'].sum():,.0f}</div>
+            <div class="metric-value">${total_revenue:,.0f}</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col3:
-        avg_monetary = df_filtered['Avg_Monetary'].mean()
         st.markdown(f"""
         <div class="metric-card">
-            <h3>Avg Customer Value</h3>
-            <div class="metric-value">${avg_monetary:.0f}</div>
+            <h3>Total Orders</h3>
+            <div class="metric-value">{total_orders:,}</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col4:
-        top_segment = df_filtered.loc[df_filtered['Total_Revenue'].idxmax(), 'Segment']
         st.markdown(f"""
         <div class="metric-card">
-            <h3>Top Revenue Segment</h3>
-            <div class="metric-value">{top_segment}</div>
+            <h3>Avg Order Value</h3>
+            <div class="metric-value">${avg_order_value:.2f}</div>
         </div>
         """, unsafe_allow_html=True)
     
-    # Main visualizations
-    st.markdown('<div class="section-header">Customer Segment Analysis</div>', unsafe_allow_html=True)
+    # Customer growth analysis
+    st.markdown('<div class="section-header">Customer Growth Analysis</div>', unsafe_allow_html=True)
+    fig_growth = create_customer_growth_chart(df_trans)
+    st.plotly_chart(fig_growth, use_container_width=True, config={'displayModeBar': False})
     
-    # Row 1: Count and Revenue charts
+    # Revenue trends
+    st.markdown('<div class="section-header">Revenue Trends & Growth</div>', unsafe_allow_html=True)
+    fig_revenue = create_revenue_trend_chart(df_trans)
+    st.plotly_chart(fig_revenue, use_container_width=True, config={'displayModeBar': False})
+    
+    # Active customers and country analysis
     col1, col2 = st.columns(2)
     
     with col1:
-        fig_count = create_segment_count_chart(df_filtered)
-        st.plotly_chart(fig_count, config={'displayModeBar': False})
+        st.markdown('<div class="section-header">Monthly Active Customers</div>', unsafe_allow_html=True)
+        fig_active = create_active_customers_chart(df_trans)
+        st.plotly_chart(fig_active, use_container_width=True, config={'displayModeBar': False})
     
     with col2:
-        fig_revenue = create_segment_revenue_chart(df_filtered)
-        st.plotly_chart(fig_revenue, config={'displayModeBar': False})
+        st.markdown('<div class="section-header">Top Countries</div>', unsafe_allow_html=True)
+        fig_country = create_country_revenue_chart(df_trans)
+        st.plotly_chart(fig_country, use_container_width=True, config={'displayModeBar': False})
     
-    # Row 2: Distribution pie charts
-    col1, col2 = st.columns(2)
+    # Cohort analysis
+    st.markdown('<div class="section-header">Customer Cohort Retention</div>', unsafe_allow_html=True)
+    fig_cohort = create_customer_cohort_chart(df_trans)
+    st.plotly_chart(fig_cohort, use_container_width=True, config={'displayModeBar': False})
+
+def main():
+    # Create tabs
+    tab1, tab2 = st.tabs(["📊 RFM Segmentation", "📈 Customer & Revenue Insights"])
     
-    with col1:
-        fig_customer_pie = create_customer_distribution_pie(df_filtered)
-        st.plotly_chart(fig_customer_pie, config={'displayModeBar': False})
+    with tab1:
+        df_rfm = load_rfm_data()
+        if df_rfm is not None:
+            render_rfm_tab(df_rfm)
+        else:
+            st.error("Unable to load RFM segmentation data. Please check your Databricks configuration.")
     
-    with col2:
-        fig_revenue_pie = create_revenue_distribution_pie(df_filtered)
-        st.plotly_chart(fig_revenue_pie, config={'displayModeBar': False})
-    
-    # RFM Heatmap
-    st.markdown('<div class="section-header">RFM Metrics Analysis</div>', unsafe_allow_html=True)
-    fig_heatmap = create_rfm_heatmap(df_filtered)
-    st.plotly_chart(fig_heatmap, config={'displayModeBar': False})
-    
-    # Segment Performance Table
-    st.header("Segment Performance & Recommendations")
-    table_df = create_segment_performance_table(df_filtered)
-    st.dataframe(
-        table_df,
-        width='stretch',
-        hide_index=True
-    )
-    
-    # Business Insights
-    st.header("Business Insights")
-    
-    # Calculate insights
-    total_customers = df_filtered['Customer_Count'].sum()
-    total_revenue = df_filtered['Total_Revenue'].sum()
-    
-    # Top performing segment
-    top_revenue_segment = df_filtered.loc[df_filtered['Total_Revenue'].idxmax()]
-    
-    # Segment with most customers
-    top_customer_segment = df_filtered.loc[df_filtered['Customer_Count'].idxmax()]
-    
-    # High-value segments (above average revenue per customer)
-    avg_revenue_per_customer = total_revenue / total_customers
-    high_value_segments = df_filtered[df_filtered['Avg_Monetary'] > avg_revenue_per_customer]
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Key Findings")
-        st.write(f"**Top Revenue Segment:** {top_revenue_segment['Segment']}")
-        st.write(f"- Generates ${top_revenue_segment['Total_Revenue']:,.2f} ({top_revenue_segment['Pct_of_Revenue']:.1f}% of total revenue)")
-        st.write(f"- Contains {top_revenue_segment['Customer_Count']:,} customers ({top_revenue_segment['Pct_of_Customers']:.1f}% of total)")
-        st.write(f"- Recommendation: {top_revenue_segment['recommendation']}")
-        
-        st.write(f"**Largest Customer Base:** {top_customer_segment['Segment']}")
-        st.write(f"- {top_customer_segment['Customer_Count']:,} customers ({top_customer_segment['Pct_of_Customers']:.1f}% of total)")
-        st.write(f"- Generates ${top_customer_segment['Total_Revenue']:,.2f} in revenue")
-        st.write(f"- Recommendation: {top_customer_segment['recommendation']}")
-    
-    with col2:
-        st.subheader("Strategic Recommendations")
-        
-        if len(high_value_segments) > 0:
-            st.write("**High-Value Segments to Focus On:**")
-            for _, segment in high_value_segments.iterrows():
-                st.write(f"- **{segment['Segment']}**: ${segment['Avg_Monetary']:.2f} avg value")
-                st.write(f"  Recommendation: {segment['recommendation']}")
-        
-        # Identify segments with growth potential
-        low_frequency_segments = df_filtered[df_filtered['Avg_Frequency'] < df_filtered['Avg_Frequency'].median()]
-        if len(low_frequency_segments) > 0:
-            st.write("**Segments with Growth Potential:**")
-            for _, segment in low_frequency_segments.head(3).iterrows():
-                st.write(f"- **{segment['Segment']}**: Low frequency ({segment['Avg_Frequency']:.1f})")
-                st.write(f"  Recommendation: {segment['recommendation']}")
+    with tab2:
+        df_trans = load_transaction_data()
+        if df_trans is not None:
+            render_insights_tab(df_trans)
+        else:
+            st.error("Unable to load transaction data. Please check your Databricks configuration.")
 
 if __name__ == "__main__":
     main()
